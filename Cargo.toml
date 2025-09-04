@@ -1,0 +1,19 @@
+[workspace]
+members = ["teecee_parse"]
+resolver = "3"
+
+[package]
+name = "teecee"
+version = "0.1.0"
+edition = "2024"
+
+[build-dependencies]
+cc = "1.2.34"
+
+[dependencies]
+ctrlc = "3.4.7"
+env_logger = "0.11.8"
+log = "0.4.27"
+teecee_parse = { path = "teecee_parse" }
+thiserror = "2.0.16"
+zerocopy = "0.8.26"
