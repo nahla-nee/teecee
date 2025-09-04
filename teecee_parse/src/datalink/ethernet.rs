@@ -4,7 +4,7 @@ use zerocopy::{big_endian, FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::datalink::arp::ArpHeader;
 
-#[repr(C)]
+#[repr(transparent)]
 #[derive(FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub struct MacAddr([u8; 6]);
 

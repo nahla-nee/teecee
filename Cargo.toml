@@ -13,6 +13,7 @@ cc = "1.2.34"
 [dependencies]
 ctrlc = "3.4.7"
 env_logger = "0.11.8"
+libc = "0.2.175"
 log = "0.4.27"
 teecee_parse = { path = "teecee_parse" }
 thiserror = "2.0.16"

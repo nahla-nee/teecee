@@ -1,27 +1,24 @@
-use std::{ffi::{c_char, c_int}, fmt::Debug, fs::File, io::Read, mem::ManuallyDrop, os::fd::{AsRawFd, FromRawFd}};
+use std::{ffi::CStr, fmt::Debug, fs::{File, OpenOptions}, io::Read, os::fd::{AsRawFd}};
 
-use log::{debug, error};
+use log::{error};
 use teecee_parse::datalink::ethernet::{EthHeader, MacAddr};
 use thiserror::Error;
 use zerocopy::{FromBytes, IntoBytes};
 
-// From tap.c, see file for function docs
-unsafe extern "C" {
-    fn create_tap(name: *mut c_char) -> c_int;
-    fn get_tap_addr(fd: c_int, addr: *mut u8) -> c_int;
-    fn close_tap(fd: c_int);
-}
-
 #[derive(Debug, Error)]
 pub enum TapError {
-    #[error("Failed to create tap device with error code {0}")]
-    Create(c_int),
-    #[error("Failed to get tap device address with error code {0}")]
-    GetAddr(c_int),
+    #[error("Failed to open tap file descriptor {0}")]
+    Create(std::io::Error),
+    #[error("Failed to set tap info with ioctl: {0}")]
+    IoctlSet(std::io::Error),
+    #[error("Failed to get tap info with ioctl: {0}")]
+    IoctlGet(std::io::Error),
+    #[error("Failed to convert name to utf8: {0}")]
+    NameUtf8(std::string::FromUtf8Error),
 }
 
 pub struct TapDevice {
-    fd: ManuallyDrop<File>,
+    fd: File,
     pub name: String,
     address: MacAddr,
     buffer: [u8; TapDevice::BUFFER_LEN]
@@ -30,46 +27,19 @@ pub struct TapDevice {
 impl TapDevice {
     const BUFFER_LEN: usize = 1522;
 
-    pub fn new() -> Result<Self, TapError> {
-        const MAX_NAME_LEN: usize = 16;
+    pub fn new(name: &CStr) -> Result<Self, TapError> {
+        let fd = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/net/tun")
+            .map_err(TapError::Create)?;
 
-        let mut name: [u8; MAX_NAME_LEN] = *b"teecee%d\0\0\0\0\0\0\0\0";
-
-        let first_null = name.iter()
-            .enumerate()
-            .find_map(|c| {
-                if *c.1 == 0 {
-                    Some(c.0)
-                }
-                else {
-                    None
-                }
-            })
-            .unwrap_or(MAX_NAME_LEN);
-
-        let fd: ManuallyDrop<File> = unsafe {
-            let fd = create_tap(name.as_mut_ptr() as _);
-
-            if fd < 0 {
-                return Err(TapError::Create(fd));
-            }
-
-            ManuallyDrop::new(FromRawFd::from_raw_fd(fd))
-        };
-
-        let mut address = MacAddr::new([0; 6]);
-        unsafe {
-            let ret = get_tap_addr(fd.as_raw_fd(), address.as_mut_bytes().as_mut_ptr()); 
-            if ret != 0 {
-                return Err(TapError::GetAddr(ret))
-            }
-        };
+        let name = Self::set_tap_with_name(&fd, name)?;
+        let address = Self::get_tap_address(&fd)?;
 
         Ok(Self {
             fd,
-            name: str::from_utf8(&name[..first_null])
-                .expect("Failed to create string from returned name")
-                .to_owned(),
+            name: name,
             address,
             buffer: [0; Self::BUFFER_LEN]
         })
@@ -94,6 +64,72 @@ impl TapDevice {
             },
         }
     }
+
+    fn set_tap_with_name(fd: &File, name: &CStr) -> Result<String, TapError> {
+        const MAX_NAME_LEN: usize = 16;
+
+        let name = unsafe {
+            let n = name.to_bytes_with_nul();
+            std::slice::from_raw_parts(n.as_ptr(), n.len())
+        };
+
+        assert!(name.len() <= MAX_NAME_LEN);
+
+        let mut ifreq: libc::ifreq;
+
+        let ret = unsafe {
+            ifreq = std::mem::zeroed();
+
+            let name = std::slice::from_raw_parts(name.as_ptr() as _, name.len());
+            ifreq.ifr_name[..name.len()].copy_from_slice(name);
+            ifreq.ifr_ifru.ifru_flags = (libc::IFF_TAP | libc::IFF_NO_PI) as _;
+
+            libc::ioctl(fd.as_raw_fd(), libc::TUNSETIFF, &mut ifreq as *mut _)
+        };
+
+        if ret < 0 {
+            return Err(TapError::IoctlSet(std::io::Error::last_os_error()));
+        }
+
+        let name_bytes = ifreq.ifr_name.iter()
+            .map_while(|c| {
+                if *c != 0 {
+                    Some(*c as u8)
+                }
+                else {
+                    None
+                }
+            })
+            .collect::<Vec<u8>>();
+
+        String::from_utf8(name_bytes).map_err(TapError::NameUtf8)
+    }
+
+    fn get_tap_address(fd: &File) -> Result<MacAddr, TapError> {
+        let mut tap_mac = MacAddr::new([0; 6]);
+        let mut ifreq: libc::ifreq;
+
+        let ret = unsafe {
+            ifreq = std::mem::zeroed();
+
+            libc::ioctl(fd.as_raw_fd(), libc::SIOCGIFHWADDR, &mut ifreq as *mut _)
+        };
+
+        if ret < 0 {
+            return Err(TapError::IoctlGet(std::io::Error::last_os_error()));
+        }
+
+        let hw_addr = unsafe {
+            &ifreq.ifr_ifru.ifru_hwaddr.sa_data[..6]
+        };
+
+        tap_mac.as_mut_bytes().iter_mut().zip(hw_addr.iter())
+            .for_each(|(tap, hw)| {
+                *tap = *hw as u8;
+            });
+
+        Ok(tap_mac)
+    }
 }
 
 impl Debug for TapDevice {
@@ -102,14 +138,5 @@ impl Debug for TapDevice {
             .field("name", &self.name)
             .field("address", &self.address)
             .finish()
-    }
-}
-
-impl Drop for TapDevice {
-    fn drop(&mut self) {
-        unsafe {
-            let fd = self.fd.as_raw_fd();
-            close_tap(fd);
-        }
     }
 }

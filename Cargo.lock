@@ -299,6 +299,7 @@ dependencies = [
  "cc",
  "ctrlc",
  "env_logger",
+ "libc",
  "log",
  "teecee_parse",
  "thiserror",

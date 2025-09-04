@@ -15,7 +15,7 @@ fn main() {
     ctrlc::set_handler(move || exit_clone.store(true, std::sync::atomic::Ordering::Relaxed))
         .expect("Error setting Ctrl-C handler");
 
-    let mut tap = match TapDevice::new() {
+    let mut tap = match TapDevice::new(c"teecee%d") {
         Ok(t) => t,
         Err(_) => {
             error!("Failed to create tap device");
