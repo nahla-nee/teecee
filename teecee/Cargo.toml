@@ -1,0 +1,13 @@
+[package]
+name = "teecee"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+thiserror = "2.0.16"
+tokio = { version = "1.47.1", features = [
+    "net", "rt", "macros", "rt-multi-thread", "sync", "signal"
+]}
+env_logger = "0.11.8"
+libc = "0.2.175"
+log = "0.4.27"
