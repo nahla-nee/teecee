@@ -8,191 +8,16 @@ use std::{
 
 use thiserror::Error;
 
-struct Mmap {
-    addr: NonNull<libc::c_void>,
-    len: usize,
+#[derive(Error, Debug)]
+pub enum UmemError {
+    #[error("Failed to allocate umem buffer: {0}")]
+    Alloc(ioError),
+    #[error("Failed to register umem buffer: {0}")]
+    Register(ioError),
 }
 
-impl Mmap {
-    fn new(len: usize) -> Result<Self, ioError> {
-        let addr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
-                -1,
-                0,
-            )
-        };
-
-        let addr = NonNull::new(addr).ok_or_else(|| ioError::last_os_error())?;
-
-        Ok(Mmap { addr, len })
-    }
-
-    /// Returns a chunk of memory for use in a ring buffer or an error
-    ///
-    /// # Parameters
-    ///
-    /// * `fd`: the `AF_XDP` file descriptor to which the umem and ring buffers belong to
-    /// * `len`: the amount of memory to allocate for the ring buffer
-    ///
-    /// # Safety
-    /// The caller must ensure that:
-    /// * `len` is the correct amount of memory to allocate for the ring
-    unsafe fn new_ring<R: RingBuffer>(fd: &XdpFd, len: usize) -> Result<Self, ioError> {
-        let addr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED | libc::MAP_POPULATE,
-                fd.as_raw_fd(),
-                R::MMAP_OFFSET,
-            )
-        };
-
-        Ok(Self {
-            addr: NonNull::new(addr).ok_or_else(ioError::last_os_error)?,
-            len,
-        })
-    }
-
-    /// Returns a pointer offset from the allocated memory by the specified amount or [None]
-    /// if the offset is greater than the amount of memory allocated
-    fn offset_by(&self, offset: usize) -> Option<NonNull<libc::c_void>> {
-        // short circuit so we know that offset is > 0 before we cast as usize
-        if offset as usize > self.len {
-            None
-        } else {
-            Some(unsafe { self.addr.add(offset) })
-        }
-    }
-}
-
-impl Drop for Mmap {
-    fn drop(&mut self) {
-        unsafe {
-            libc::munmap(self.addr.as_mut(), self.len);
-        }
-    }
-}
-
-/// A trait representing the properties of a ring buffer
-///
-/// # Safety
-/// The implementor must ensure that:
-/// * `BufferElementType` is the correct type of data that the ring buffer will hold
-/// * `SETSOCKOPT_NAME` is the correct value to pass to [libc::setsockopt] for the ring type this
-/// trait is being implemented for
-/// * `MMAP_OFFSET` is the correct value to pass as the offset parameter to [libc::mmap] for the
-/// ring type this trait is being implemented for
-/// * `ELEMENT_SIZE` is the size of each entry in the buffer, that is it is the size of
-/// `BufferElementType`. This is already the case by default, so do not modify this value
-/// * `RING_LEN` is the a positive power of two
-unsafe trait RingBuffer {
-    type BufferElementType;
-
-    const SETSOCKOPT_NAME: i32;
-    const MMAP_OFFSET: libc::off_t;
-
-    const ELEMENT_SIZE: usize = size_of::<Self::BufferElementType>();
-    const RING_LEN: usize = 512;
-
-    /// Constructs a ring buffer from pointers
-    ///
-    /// # Safety
-    /// The caller must ensure that:
-    /// * `base` is a pointer to an mmaped memory region representing a buffer ring
-    /// * `offsets` is the offset struct associated with the mapped memory region
-    unsafe fn new(fd: &XdpFd, offsets: libc::xdp_ring_offset) -> Result<Self, ioError>
-    where Self: Sized;
-}
-
-macro_rules! new_ring_buffer {
-    ($name:ident, $data:ty, $sockopt:expr, $mmap:expr) => {
-        struct $name {
-            mem: Mmap,
-            producer: NonNull<AtomicU32>,
-            consumer: NonNull<AtomicU32>,
-            data: NonNull<[$data; Self::RING_LEN]>,
-        }
-
-        unsafe impl RingBuffer for $name {
-            type BufferElementType = $data;
-
-            const SETSOCKOPT_NAME: i32 = $sockopt;
-            const MMAP_OFFSET: libc::off_t = $mmap;
-
-            unsafe fn new(fd: &XdpFd, offsets: libc::xdp_ring_offset) -> Result<Self, ioError> {
-                assert!(
-                    Self::RING_LEN > 0 && Self::RING_LEN.count_ones() == 1,
-                    "Buffer data length is not a positive power of two"
-                );
-
-                let mem = unsafe {
-                    Mmap::new_ring::<Self>(
-                        fd,
-                        offsets.desc as usize + Self::RING_LEN as usize * Self::ELEMENT_SIZE,
-                    )
-                }?;
-
-                let producer = mem
-                    .offset_by(offsets.producer as _)
-                    .expect("Failed to get producer offset pointer")
-                    .cast();
-                let consumer = mem
-                    .offset_by(offsets.consumer as _)
-                    .expect("Failed to get consumer offset pointer")
-                    .cast();
-                let data = mem
-                    .offset_by(offsets.desc as _)
-                    .expect("Failed to get desc offset pointer")
-                    .cast();
-
-                let data: &[_; Self::RING_LEN] =
-                    unsafe { std::slice::from_raw_parts(data.as_ptr(), Self::RING_LEN) }
-                        .try_into()
-                        .expect("Failed to convert data from slice to array");
-
-                Ok(Self {
-                    mem,
-                    producer,
-                    consumer,
-                    data: NonNull::from_ref(data),
-                })
-            }
-        }
-    };
-}
-
-new_ring_buffer!(
-    RxBuffer,
-    libc::xdp_desc,
-    libc::XDP_RX_RING,
-    libc::XDP_PGOFF_RX_RING
-);
-new_ring_buffer!(
-    TxBuffer,
-    libc::xdp_desc,
-    libc::XDP_TX_RING,
-    libc::XDP_PGOFF_TX_RING
-);
-new_ring_buffer!(
-    FillBuffer,
-    u64,
-    libc::XDP_UMEM_FILL_RING,
-    libc::XDP_UMEM_PGOFF_FILL_RING as _
-);
-new_ring_buffer!(
-    CompletionBuffer,
-    u64,
-    libc::XDP_UMEM_COMPLETION_RING,
-    libc::XDP_UMEM_PGOFF_COMPLETION_RING as _
-);
-
-struct Umem(Mmap);
+/// A Umem buffer containing a page aligned buffer that is exactly [Self::BUF_LEN] bytes long
+struct Umem(NonNull<[u8; Self::BUF_LEN]>);
 
 impl Umem {
     const CHUNK_SIZE: usize = 4096;
@@ -200,8 +25,48 @@ impl Umem {
     const BUF_LEN: usize = Self::CHUNK_SIZE * Self::CHUNK_COUNT;
 
     /// Allocates a page aligned buffer of size [Self::BUF_LEN]
-    pub fn new() -> Result<Umem, ioError> {
-        Ok(Umem(Mmap::new(Self::BUF_LEN)?))
+    pub fn new(fd: &XdpFd) -> Result<Umem, UmemError> {
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                Self::BUF_LEN,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                -1,
+                0,
+            )
+        };
+        let addr = NonNull::new(addr).ok_or_else(|| UmemError::Alloc(ioError::last_os_error()))?;
+
+        let umem = Umem(addr.cast());
+        umem.register_buffer(fd).map_err(UmemError::Register)?;
+        Ok(umem)
+    }
+
+    /// Registers the [Umem] buffer with the specified [XdpSock]
+    fn register_buffer(&self, fd: &XdpFd) -> Result<(), ioError> {
+        let umem_reg = libc::xdp_umem_reg {
+            addr: self.as_ptr() as _,
+            len: self.len() as _,
+            chunk_size: Umem::CHUNK_SIZE as _,
+            headroom: 0,
+            flags: 0,
+            tx_metadata_len: 0,
+        };
+
+        // Safety: XDP_UMEM_REG is a valid operation and umem_reg is a valid parameter to pass it
+        unsafe { setsockopt(&fd, libc::XDP_UMEM_REG, &umem_reg) }
+    }
+}
+
+impl Drop for Umem {
+    fn drop(&mut self) {
+        // Safety:
+        // We acquired this memory through mmap and therefor its safe to pass it to munmap to free
+        // it. The allocation always has the size Self::BUF_LEN
+        unsafe {
+            libc::munmap(self.0.cast().as_ptr(), Self::BUF_LEN);
+        }
     }
 }
 
@@ -209,13 +74,212 @@ impl Deref for Umem {
     type Target = [u8; Self::BUF_LEN];
 
     fn deref(&self) -> &Self::Target {
-        unsafe { self.0.addr.cast().as_ref() }
+        // Safety:
+        // Pointer to reference conversion criteria are met as the buffer is aligned, the pointer,
+        // by definition of NonNull, is not null, is dereferncable, points to valid value of T.
+        // We also follow rust's aliasing rules as the borrow checker will see this as a reference
+        // to the umem struct wrapping it
+        unsafe {self.0.as_ref()}
     }
 }
 
 impl DerefMut for Umem {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { self.0.addr.cast().as_mut() }
+        // Safety:
+        // Pointer to reference conversion criteria are met as the buffer is aligned, the pointer,
+        // by definition of NonNull, is not null, is dereferncable, points to valid value of T.
+        // We also follow rust's aliasing rules as the borrow checker will see this as a reference
+        // to the umem struct wrapping it
+        unsafe { self.0.as_mut() }
+    }
+}
+
+struct RingBuffer<T, const N: usize, const M: libc::off_t> {
+    mem: NonNull<libc::c_void>,
+    mem_len: usize,
+    producer: NonNull<AtomicU32>,
+    consumer: NonNull<AtomicU32>,
+    data: NonNull<[T; N]>
+}
+
+impl<T, const N: usize, const M: libc::off_t> RingBuffer<T, N, M> {
+    /// Allocates a ring buffer given an XDP socket and the offsets associated with it
+    ///
+    /// # Safety
+    /// The caller must ensure that `offsets` is the correct offset struct associated with the
+    /// ring buffer type
+    unsafe fn new(fd: &XdpFd, offsets: libc::xdp_ring_offset) -> Result<Self, ioError> {
+        assert!(
+            N > 0 && N.count_ones() == 1,
+            "Buffer data length is not a positive power of two"
+        );
+
+        let mem_len = offsets.desc as usize + N * size_of::<T>();
+
+        let mem = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                mem_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_POPULATE,
+                fd.as_raw_fd(),
+                M,
+            )
+        };
+
+        let mem = NonNull::new(mem).ok_or_else(|| ioError::last_os_error())?;
+
+        let producer = unsafe { mem.add(offsets.producer as _).cast() };
+        let consumer = unsafe { mem.add(offsets.consumer as _).cast() };
+        let data = unsafe { mem.add(offsets.desc as _).cast() };
+
+        Ok(Self {
+            mem,
+            mem_len,
+            producer,
+            consumer,
+            data,
+        })
+    }
+}
+
+impl<T, const N: usize, const M: libc::off_t> Drop for RingBuffer<T, N, M> {
+    fn drop(&mut self) {
+        // Safety:
+        // We acquired this memory through mmap and therefor its safe to pass it to munmap to free
+        // it. The allocation size is always stored in mem_len
+        unsafe {
+            libc::munmap(self.mem.cast().as_ptr(), self.mem_len);
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum RingBufferError {
+    #[error("Failed to register the buffer: {0}")]
+    Register(ioError),
+    #[error("Failed to buffer offsets: {0}")]
+    GetOffsets(ioError),
+    #[error("Failed to allocate the buffer: {0}")]
+    Alloc(ioError),
+}
+
+struct RxBuffer(RingBuffer<libc::xdp_desc, {Self::RING_LEN}, {libc::XDP_PGOFF_RX_RING}>);
+struct TxBuffer(RingBuffer<libc::xdp_desc, {Self::RING_LEN}, {libc::XDP_PGOFF_TX_RING}>);
+struct FillBuffer(RingBuffer<u64, {Self::RING_LEN}, {libc::XDP_UMEM_PGOFF_FILL_RING as _}>);
+struct CompletionBuffer(RingBuffer<u64, {Self::RING_LEN},
+    {libc::XDP_UMEM_PGOFF_COMPLETION_RING as _}>);
+
+impl RxBuffer {
+    const RING_LEN: usize = 512;
+
+    pub fn new(fd: &XdpFd) -> Result<RxBuffer, RingBufferError> {
+        Self::register_ring_buffer(fd).map_err(RingBufferError::Register)?;
+        let offsets = Self::get_ring_offsets(fd).map_err(RingBufferError::GetOffsets)?;
+        // Safety:
+        // offsets is the correct offset for the RxBuffer
+        unsafe {
+            Ok(Self(
+                RingBuffer::new(fd, offsets).map_err(RingBufferError::Alloc)?
+            ))
+        }
+    }
+ 
+    /// Attempts to get the offsets for an RX ring buffer
+    fn get_ring_offsets(fd: &XdpFd) -> Result<libc::xdp_ring_offset, ioError> {
+        let mut offsets: libc::xdp_mmap_offsets = unsafe { std::mem::zeroed() };
+        unsafe { getsockopt(fd, libc::XDP_MMAP_OFFSETS, &mut offsets) }?;
+        Ok(offsets.rx)
+    }
+
+    /// Attempts to allocate a ring buffer of the specified type and size with the kernel
+    fn register_ring_buffer(fd: &XdpFd) -> Result<(), ioError> {
+        // ring buffer length is always a power of two, invariant ensured by constructor
+        unsafe { setsockopt(fd, libc::XDP_RX_RING, &512) }
+    }
+}
+
+impl TxBuffer {
+    const RING_LEN: usize = 512;
+    pub fn new(fd: &XdpFd) -> Result<TxBuffer, RingBufferError> {
+        Self::register_ring_buffer(fd).map_err(RingBufferError::Register)?;
+        let offsets = Self::get_ring_offsets(fd).map_err(RingBufferError::GetOffsets)?;
+        // Safety:
+        // offsets is the correct offset for the RxBuffer
+        unsafe {
+            Ok(Self(
+                RingBuffer::new(fd, offsets).map_err(RingBufferError::Alloc)?
+            ))
+        }
+    }
+ 
+    /// Attempts to get the offsets for an RX ring buffer
+    fn get_ring_offsets(fd: &XdpFd) -> Result<libc::xdp_ring_offset, ioError> {
+        let mut offsets: libc::xdp_mmap_offsets = unsafe { std::mem::zeroed() };
+        unsafe { getsockopt(fd, libc::XDP_MMAP_OFFSETS, &mut offsets) }?;
+        Ok(offsets.tx)
+    }
+
+    /// Attempts to allocate a ring buffer of the specified type and size with the kernel
+    fn register_ring_buffer(fd: &XdpFd) -> Result<(), ioError> {
+        // ring buffer length is always a power of two, invariant ensured by constructor
+        unsafe { setsockopt(fd, libc::XDP_TX_RING, &512) }
+    }
+}
+
+impl FillBuffer {
+    const RING_LEN: usize = 512;
+    pub fn new(fd: &XdpFd) -> Result<FillBuffer, RingBufferError> {
+        Self::register_ring_buffer(fd).map_err(RingBufferError::Register)?;
+        let offsets = Self::get_ring_offsets(fd).map_err(RingBufferError::GetOffsets)?;
+        // Safety:
+        // offsets is the correct offset for the RxBuffer
+        unsafe {
+            Ok(Self(
+                RingBuffer::new(fd, offsets).map_err(RingBufferError::Alloc)?
+            ))
+        }
+    }
+ 
+    /// Attempts to get the offsets for an RX ring buffer
+    fn get_ring_offsets(fd: &XdpFd) -> Result<libc::xdp_ring_offset, ioError> {
+        let mut offsets: libc::xdp_mmap_offsets = unsafe { std::mem::zeroed() };
+        unsafe { getsockopt(fd, libc::XDP_MMAP_OFFSETS, &mut offsets) }?;
+        Ok(offsets.fr)
+    }
+
+    /// Attempts to allocate a ring buffer of the specified type and size with the kernel
+    fn register_ring_buffer(fd: &XdpFd) -> Result<(), ioError> {
+        // ring buffer length is always a power of two, invariant ensured by constructor
+        unsafe { setsockopt(fd, libc::XDP_UMEM_FILL_RING, &512) }
+    }
+}
+
+impl CompletionBuffer {
+    const RING_LEN: usize = 512;
+    pub fn new(fd: &XdpFd) -> Result<CompletionBuffer, RingBufferError> {
+        Self::register_ring_buffer(fd).map_err(RingBufferError::Register)?;
+        let offsets = Self::get_ring_offsets(fd).map_err(RingBufferError::GetOffsets)?;
+        // Safety:
+        // offsets is the correct offset for the RxBuffer
+        unsafe {
+            Ok(Self(
+                RingBuffer::new(fd, offsets).map_err(RingBufferError::Alloc)?
+            ))
+        }
+    }
+ 
+    /// Attempts to get the offsets for an RX ring buffer
+    fn get_ring_offsets(fd: &XdpFd) -> Result<libc::xdp_ring_offset, ioError> {
+        let mut offsets: libc::xdp_mmap_offsets = unsafe { std::mem::zeroed() };
+        unsafe { getsockopt(fd, libc::XDP_MMAP_OFFSETS, &mut offsets) }?;
+        Ok(offsets.cr)
+    }
+
+    /// Attempts to allocate a ring buffer of the specified type and size with the kernel
+    fn register_ring_buffer(fd: &XdpFd) -> Result<(), ioError> {
+        // ring buffer length is always a power of two, invariant ensured by constructor
+        unsafe { setsockopt(fd, libc::XDP_UMEM_COMPLETION_RING, &512) }
     }
 }
 
@@ -258,12 +322,16 @@ impl Drop for XdpFd {
 pub enum XdpSockError {
     #[error("Failed to create xdp socket: {0}")]
     Socket(ioError),
-    #[error("Failed to allocate umem buffer")]
-    UmemAlloc(ioError),
-    #[error("Failed to register umem buffer: {0}")]
-    UmemReg(ioError),
-    #[error("Failed to allocate ring buffers: {0}\nContext: {1}")]
-    RingAlloc(ioError, &'static str),
+    #[error("Failed to create umem buffer: {0}")]
+    Umem(UmemError),
+    #[error("Rx buffer operation failed: {0}")]
+    RxError(RingBufferError),
+    #[error("Tx buffer operation failed: {0}")]
+    TxError(RingBufferError),
+    #[error("Fill buffer operation failed: {0}")]
+    FillError(RingBufferError),
+    #[error("Completion buffer operation failed: {0}")]
+    CompletionError(RingBufferError),
     #[error("Failed to find an appropriate network interface")]
     IfiSearchFail,
     #[error("Failed to find an appropriate network interface due to error: {0}")]
@@ -285,10 +353,12 @@ impl XdpSock {
     pub fn new() -> Result<XdpSock, XdpSockError> {
         let fd = XdpFd::new().map_err(XdpSockError::Socket)?;
 
-        let umem = Umem::new().map_err(XdpSockError::UmemAlloc)?;
-        Self::register_umem(&fd, &umem).map_err(XdpSockError::UmemReg)?;
+        let umem = Umem::new(&fd).map_err(XdpSockError::Umem)?;
 
-        let (rx, tx, fill, completion) = Self::get_ring_buffers(&fd)?;
+        let rx = RxBuffer::new(&fd).map_err(XdpSockError::RxError)?;
+        let tx = TxBuffer::new(&fd).map_err(XdpSockError::TxError)?;
+        let fill = FillBuffer::new(&fd).map_err(XdpSockError::FillError)?;
+        let completion = CompletionBuffer::new(&fd).map_err(XdpSockError::CompletionError)?;
 
         Self::bind(&fd, None)?;
 
@@ -300,64 +370,6 @@ impl XdpSock {
             fill,
             completion,
         })
-    }
-
-    fn get_ring_buffers(
-        fd: &XdpFd,
-    ) -> Result<(RxBuffer, TxBuffer, FillBuffer, CompletionBuffer), XdpSockError> {
-        Self::register_ring_buffer::<RxBuffer>(fd)
-            .map_err(|e| XdpSockError::RingAlloc(e, "Failed to register rx buffer"))?;
-        Self::register_ring_buffer::<TxBuffer>(fd)
-            .map_err(|e| XdpSockError::RingAlloc(e, "Failed to register tx buffer"))?;
-        Self::register_ring_buffer::<FillBuffer>(fd)
-            .map_err(|e| XdpSockError::RingAlloc(e, "Failed to register fill buffer"))?;
-        Self::register_ring_buffer::<CompletionBuffer>(fd)
-            .map_err(|e| XdpSockError::RingAlloc(e, "Failed to register completion buffer"))?;
-
-        let offsets = Self::get_ring_offsets(&fd)
-            .map_err(|e| XdpSockError::RingAlloc(e, "Failed to get ring offsets"))?;
-
-        unsafe {
-            Ok((
-                RxBuffer::new(fd, offsets.rx)
-                    .map_err(|e| XdpSockError::RingAlloc(e, "Failed to create rx buffer"))?,
-                TxBuffer::new(fd, offsets.tx)
-                    .map_err(|e| XdpSockError::RingAlloc(e, "Failed to create tx buffer"))?,
-                FillBuffer::new(fd, offsets.fr)
-                    .map_err(|e| XdpSockError::RingAlloc(e, "Failed to create fill buffer"))?,
-                CompletionBuffer::new(fd, offsets.cr).map_err(|e| {
-                    XdpSockError::RingAlloc(e, "Failed to create completion buffer")
-                })?,
-            ))
-        }
-    }
-
-    fn get_ring_offsets(fd: &XdpFd) -> Result<libc::xdp_mmap_offsets, ioError> {
-        let mut offsets = unsafe { std::mem::zeroed() };
-
-        unsafe { Self::getsockopt(fd, libc::XDP_MMAP_OFFSETS, &mut offsets) }?;
-        Ok(offsets)
-    }
-
-    /// Attempts to allocate a ring buffer of the specified type and size with the kernel
-    fn register_ring_buffer<T: RingBuffer>(fd: &XdpFd) -> Result<(), ioError> {
-        // ring buffer length is always a power of two, invariant ensured by constructor
-        unsafe { Self::setsockopt(fd, T::SETSOCKOPT_NAME, &T::RING_LEN) }
-    }
-
-    /// Attempts to register the umem buffer with the kernel
-    fn register_umem(fd: &XdpFd, umem: &Umem) -> Result<(), ioError> {
-        let umem_reg = libc::xdp_umem_reg {
-            addr: umem.as_ptr() as _,
-            len: umem.len() as _,
-            chunk_size: Umem::CHUNK_SIZE as _,
-            headroom: 0,
-            flags: 0,
-            tx_metadata_len: 0,
-        };
-
-        // Safety: XDP_UMEM_REG is a valid operation and umem_reg is a valid parameter to pass it
-        unsafe { Self::setsockopt(&fd, libc::XDP_UMEM_REG, &umem_reg) }
     }
 
     fn bind(fd: &XdpFd, ifindex: Option<u32>) -> Result<(), XdpSockError> {
@@ -443,64 +455,64 @@ impl XdpSock {
 
         name
     }
+}
 
-    /// A thin wrapper around [libc::setsockopt] that maps the return value to a [Result]
-    ///
-    /// # Parameters:
-    ///
-    /// * `op_name`: The name value of the operation to perform, e.g. [libc::XDP_UMEM_REG].
-    /// * `value` : Reference to the value that is to be passed.
-    ///
-    /// # Safety
-    /// The caller must ensure that:
-    /// * `op_name` is a valid value to pass as the name parameter to [libc::setsockopt]
-    /// * `value` is a valid value to give to the operation associated with `op_name`
-    unsafe fn setsockopt<T>(fd: &XdpFd, op_name: i32, value: &T) -> Result<(), ioError> {
-        let result = unsafe {
-            libc::setsockopt(
-                fd.as_raw_fd(),
-                libc::SOL_XDP,
-                op_name,
-                value as *const _ as _,
-                size_of::<T>() as _,
-            )
-        };
+/// A thin wrapper around [libc::setsockopt] that maps the return value to a [Result]
+///
+/// # Parameters:
+///
+/// * `op_name`: The name value of the operation to perform, e.g. [libc::XDP_UMEM_REG].
+/// * `value` : Reference to the value that is to be passed.
+///
+/// # Safety
+/// The caller must ensure that:
+/// * `op_name` is a valid value to pass as the name parameter to [libc::setsockopt]
+/// * `value` is a valid value to give to the operation associated with `op_name`
+unsafe fn setsockopt<T>(fd: &XdpFd, op_name: i32, value: &T) -> Result<(), ioError> {
+    let result = unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_XDP,
+            op_name,
+            value as *const _ as _,
+            size_of::<T>() as _,
+        )
+    };
 
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(ioError::last_os_error())
-        }
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(ioError::last_os_error())
     }
+}
 
-    /// A thin wrapper around [libc::getsockopt] that maps the return value to a [Result]
-    ///
-    /// # Parameters:
-    ///
-    /// * `op_name`: The name value of the operation to perform, e.g. [libc::XDP_UMEM_REG].
-    /// * `value` : Reference to a type to be written to.
-    ///
-    /// # Safety
-    ///
-    /// When you call this function you have to ensure that `op_name` is a valid operation value and
-    /// that `value` is a valid type and value to pass as the operation's output parameter.
-    unsafe fn getsockopt<T>(fd: &XdpFd, op_name: i32, value: &mut T) -> Result<(), ioError> {
-        let mut optlen: libc::socklen_t = size_of::<T>() as _;
+/// A thin wrapper around [libc::getsockopt] that maps the return value to a [Result]
+///
+/// # Parameters:
+///
+/// * `op_name`: The name value of the operation to perform, e.g. [libc::XDP_UMEM_REG].
+/// * `value` : Reference to a type to be written to.
+///
+/// # Safety
+///
+/// When you call this function you have to ensure that `op_name` is a valid operation value and
+/// that `value` is a valid type and value to pass as the operation's output parameter.
+unsafe fn getsockopt<T>(fd: &XdpFd, op_name: i32, value: &mut T) -> Result<(), ioError> {
+    let mut optlen: libc::socklen_t = size_of::<T>() as _;
 
-        let result = unsafe {
-            libc::getsockopt(
-                fd.as_raw_fd(),
-                libc::SOL_XDP,
-                op_name,
-                value as *mut _ as _,
-                &mut optlen as *mut _,
-            )
-        };
+    let result = unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_XDP,
+            op_name,
+            value as *mut _ as _,
+            &mut optlen as *mut _,
+        )
+    };
 
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(ioError::last_os_error())
-        }
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(ioError::last_os_error())
     }
 }
