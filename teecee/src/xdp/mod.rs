@@ -6,6 +6,7 @@ use std::{
     sync::atomic::AtomicU32,
 };
 
+use log::debug;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -380,7 +381,7 @@ impl XdpSock {
 
         let sockaddr = libc::sockaddr_xdp {
             sxdp_family: libc::AF_XDP as _,
-            sxdp_flags: 0,
+            sxdp_flags: libc::XDP_ZEROCOPY,
             sxdp_ifindex: ifindex,
             sxdp_queue_id: 0,
             sxdp_shared_umem_fd: fd.as_raw_fd() as _,
@@ -422,22 +423,30 @@ impl XdpSock {
         }
 
         let needed_flags = libc::IFF_UP as u32;
-        let blocked_flags = (libc::IFF_LOOPBACK & libc::IFF_NOARP) as u32;
+        let blocked_flags = (libc::IFF_LOOPBACK | libc::IFF_NOARP) as u32;
 
         let mut curr = ifaddrs;
         while !curr.is_null() {
             // Safety:
             // We know ifaddrs isn't null, otherwise we can't be in the loop so we can deref
-            let ifaddr = unsafe { (*curr) };
+            let ifaddr = unsafe { curr.as_ref().expect("curr was null when iterating NICs") };
 
             if (ifaddr.ifa_flags & needed_flags) > 0 && (ifaddr.ifa_flags & blocked_flags) == 0 {
+                // Safety:
+                // An ifaddrs struct's ifa_name points to a null terminated interface name
+                unsafe {
+                    debug!(
+                        "Selected device with name: {}",
+                        std::ffi::CStr::from_ptr(ifaddr.ifa_name).to_string_lossy()
+                    );
+                }
                 break;
             }
 
             curr = ifaddr.ifa_next;
         }
 
-        let name = NonNull::new(curr)
+        let index = NonNull::new(curr)
             .and_then(|a| {
                 // Safety:
                 // An ifaddrs struct's ifa_name points to a null terminated interface name so
@@ -453,7 +462,7 @@ impl XdpSock {
         // up the allocated memory
         unsafe { libc::freeifaddrs(ifaddrs) };
 
-        name
+        index
     }
 }
 
