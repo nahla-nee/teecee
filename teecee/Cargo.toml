@@ -10,4 +10,4 @@ tokio = { version = "1.47.1", features = [
 ]}
 env_logger = "0.11.8"
 libc = "0.2.175"
-log = "0.4.27"
+log = "0.4.29"

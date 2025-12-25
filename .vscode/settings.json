@@ -1,0 +1,9 @@
+{
+    "files.associations": {
+        "ioctl.h": "c",
+        "if.h": "c",
+        "if_tun.h": "c",
+        "if_xdp.h": "c",
+        "socket.h": "c"
+    }
+}
